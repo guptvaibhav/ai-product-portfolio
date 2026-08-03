@@ -7,15 +7,15 @@ Supporting detail for the [main case study](README.md). This document goes one l
 ![Resolution Intelligence system architecture — Iteration 3](assets/system-architecture.png)
 
 1. **Input & linked tickets** — a structured ticket JSON (id, title, description, severity, status, labels, stack trace, comments, timestamps) plus any known linked tickets (parent/child/duplicate).
-2. **Normalize & redact** — schema validation, PII removal, exact-token and entity extraction, and construction of both semantic and lexical query representations.
+2. **Normalize & redact** — schema validation, deterministic sensitive-data redaction (regex-based matching on emails, phone numbers, and API-key/token/secret patterns — not general PII/entity detection), exact-token extraction, and construction of both semantic and lexical query representations.
 3. **Parallel retrieval** — dense (Qwen3-Embedding-0.6B + FAISS) and lexical (SQLite FTS5) retrieval run against the solved-issue index, plus typed-graph traversal (`duplicate_of`, `depends_on`, `blocks`, `see_also`) and a gated StackOverflow fallback when internal evidence is thin on an exact identifier.
 4. **Evidence pack assembly** — deduplicated, scored, ranked evidence with stable IDs, confidence and support-level tagging, and identified gaps.
 5. **Evidence aggregation** — a lower-cost model (`gpt-4.1-mini`) deduplicates and summarizes evidence sections, applies deterministic calibration, and sanitizes/repairs citations before they reach the reasoning stage.
 6. **Reasoning & synthesis** — a reasoning model (`gpt-5-mini`) produces a summary, related tickets with citations, candidate resolutions, and confidence/gap assessment. It can only make claims that trace to evidence IDs from the pack.
-7. **Classifier / router** — routes each case to a fully-autonomous low-risk path or a human-review path based on confidence, severity, and evidence gaps.
-8. **Feedback capture** — records a yes/no signal and human notes per case as evaluation data. No automatic retraining in the current iteration.
+7. **Classifier / router** — the core workflow (`classify_and_route`) assigns each case to one of three routes: fully autonomous (low risk), semi-autonomous (known issue, needs human approval), or human-led (high risk or low confidence). A simpler two-route fallback (autonomous vs. human-review) exists in the lightweight UI demo path and is what the canonical 26-case evaluation set exercises.
+8. **Feedback capture** — records a yes/no signal and human notes per case as evaluation data. No automatic retraining in the current iteration. This stage is not currently instrumented with its own trace span.
 
-Guardrails (RAGAS-style evaluation) and observability (Arize/Phoenix tracing of each branch, tokens, latency, and failures) run alongside this pipeline rather than as pipeline stages themselves.
+Runtime guardrails (citation validation, routing policy enforcement) are inline pipeline behavior, not separate stages. RAGAS-style evaluation (offline, does not affect runtime behavior) and observability (Arize/Phoenix tracing of most stages, tokens, latency, and failures) run alongside the pipeline.
 
 ## Data layer
 

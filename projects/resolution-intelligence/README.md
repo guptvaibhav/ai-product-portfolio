@@ -32,10 +32,10 @@ The underlying task — "has something like this happened before, and what worke
 
 A chat interface that answers questions about tickets would be easy to build and easy to get wrong in ways that erode trust. The product decisions here are specifically about *not* being a free-form chatbot:
 
-- **Retrieval before synthesis** — the model never answers from parametric memory; it can only reason over an evidence pack that was assembled deterministically before the reasoning step runs.
-- **Evidence IDs, not prompt-only citation requests** — each retrieved item gets a stable ID at assembly time, and claims are checked against those IDs after generation, instead of just asking the model nicely to cite sources.
+- **Evidence-grounded generation, checked after the fact** — the reasoning step runs over a deterministically assembled evidence pack, and every generated claim is checked against real evidence IDs after generation, with citations sanitized or repaired when they don't resolve — a downstream control, not just an instruction to the model to "please cite sources."
+- **Evidence IDs, not prompt-only citation requests** — each retrieved item gets a stable ID at assembly time, so citation checking is a lookup, not a judgment call.
 - **Exact-token fallback** — stack traces, error codes, and identifiers are matched with SQLite FTS5 lexical search alongside dense retrieval, because semantic similarity alone misses exact strings that matter most for technical diagnosis.
-- **Confidence-gated routing, not a universal answer** — every case is classified into an autonomous or human-review path; the system is designed to say "I don't have enough evidence" rather than produce a plausible-sounding guess.
+- **Confidence-gated routing, not a universal answer** — the core workflow classifies cases into three routes (fully autonomous, semi-autonomous with human approval, human-led review); the system is designed to say "I don't have enough evidence" and escalate rather than produce a plausible-sounding guess.
 - **Feedback as evaluation data, not silent retraining** — engineer feedback is captured and stored for evaluation; the first iteration deliberately does not auto-retrain on it.
 
 ## Product principles
@@ -65,7 +65,7 @@ The team scoped the build as three iterations of increasing capability, each shi
 
 **Iteration 2 — Grounded reasoning and cited resolution synthesis.** Add an aggregation stage that deduplicates and scores evidence, then a reasoning stage that produces a resolution recommendation, candidate solutions, and confidence — with every claim required to trace back to an evidence ID.
 
-**Iteration 3 — Risk-aware routing, human review, feedback capture, and improvement.** Add a classifier/router that splits cases into autonomous vs. human-review paths based on confidence and severity, capture structured engineer feedback, layer in RAGAS-based automated quality evaluation, and add a gated, low-trust external fallback (StackOverflow, via a cache-first, write-through source) for cases where internal evidence is thin.
+**Iteration 3 — Risk-aware routing, human review, feedback capture, and improvement.** Add a classifier/router that assigns cases to a fully autonomous, semi-autonomous (human approval), or human-led path based on confidence and severity, capture structured engineer feedback, layer in RAGAS-style automated quality evaluation, and add a gated, low-trust external fallback (StackOverflow, via a cache-first, write-through source) for cases where internal evidence is thin.
 
 The current repository reflects the union of all three iterations — the architecture diagram below is the Iteration 3 state.
 
@@ -75,20 +75,22 @@ The current repository reflects the union of all three iterations — the archit
 
 *Diagram from the team's original repository (`reports/architecture/updated_system_diagram.png`), reproduced here for context.*
 
-At a high level: a ticket is normalized and redacted, used to build both semantic and lexical retrieval queries, run against the Eclipse SQLite store (dense + FTS5 + typed-graph relationships, with a gated StackOverflow fallback), assembled into a scored evidence pack, aggregated, reasoned over by an LLM that must cite evidence, routed by a confidence-aware classifier, and closed with structured feedback capture. RAGAS-based guardrails and Arize/Phoenix tracing run alongside the pipeline rather than inside it. Full stage-by-stage detail is in [architecture.md](architecture.md).
+At a high level: a ticket is normalized and put through deterministic sensitive-data redaction, used to build both semantic and lexical retrieval queries, run against the Eclipse SQLite store (dense + FTS5 + typed-graph relationships, with a gated StackOverflow fallback), assembled into a scored evidence pack, aggregated, reasoned over by an LLM that must cite evidence, routed by a confidence-aware classifier, and closed with structured feedback capture. Runtime guardrails (citation validation, routing policy) enforce behavior inline; RAGAS-style evaluation and Arize/Phoenix tracing run alongside the pipeline as offline quality checks rather than inside it. Full stage-by-stage detail is in [architecture.md](architecture.md).
 
 ## Data and retrieval strategy
 
-The team split the 301,464-record Eclipse corpus into explicit knowledge tiers instead of indexing everything as equally trustworthy:
+About 174,000 of the 301,464 Eclipse records (`FIXED` + `WORKSFORME`) form the broader pool of *answer-eligible* solved knowledge — but the team didn't treat that pool as one undifferentiated tier. It's split further into a strict default-recommend tier and weaker supporting tiers:
 
 | Tier | Approx. size | Treatment |
 |---|---|---|
-| Gold solved (`FIXED`, `WORKSFORME`) | ~174,000 | Eligible as a recommended resolution |
+| `solution_gold` | 109,278 | Default recommend-eligible solution index |
+| `solution_silver` (archived / text-thin fixed issues) | ~41,756 | Lower-weighted secondary solution index |
+| `weak_resolution` (`WORKSFORME`) | 23,394 | Weak-resolution index — supporting evidence, lower confidence |
 | Duplicate-linked | 40,946 | Used as retrieval/clustering supervision, not recommended directly |
 | `WONTFIX` | 41,646 | Kept as policy/limitation evidence only — never recommended as a fix |
 | Open / unresolved | 21,589 | Shown for situational awareness only — never recommended |
 
-This matters because a retrieval system that can't tell a fixed issue from an abandoned or still-open one will confidently recommend things that were never actually solutions. Retrieval itself is hybrid: **Qwen3-Embedding-0.6B** dense vectors for semantic similarity (with an OpenAI `text-embedding-3-small` path for CPU-only environments), **SQLite FTS5** for exact-token matching on stack traces and identifiers, and typed graph relationships (`duplicate_of`, `depends_on`, `blocks`, `see_also`) for structured issue context beyond plain similarity.
+This matters because a retrieval system that can't tell a fixed issue from an abandoned or still-open one will confidently recommend things that were never actually solutions — and even within "solved," a well-documented gold fix isn't the same reliability signal as a sparse `WORKSFORME` workaround. Retrieval itself is hybrid: **Qwen3-Embedding-0.6B** dense vectors for semantic similarity (with a documented `text-embedding-3-small` OpenAI-embedding path for CPU-only setups, selected via an alternate retrieval index rather than the default Docker Compose configuration), **SQLite FTS5** for exact-token matching on stack traces and identifiers, and typed graph relationships (`duplicate_of`, `depends_on`, `blocks`, `see_also`) for structured issue context beyond plain similarity.
 
 ## Evidence-pack concept
 
@@ -96,14 +98,17 @@ Rather than passing raw retrieved text into a prompt and hoping the model cites 
 
 ## Guardrails
 
-- **Citation validity checks** — generated claims are checked against real evidence IDs, with sanitization and conditional repair when a citation doesn't resolve.
-- **RAGAS-based automated evaluation** — faithfulness, answer relevance, context precision, and context recall run as part of the quality gate (detail in [evaluation-and-guardrails.md](evaluation-and-guardrails.md)).
-- **Gated, low-trust external fallback** — the StackOverflow web source only engages when internal evidence is thin on an exact match, is cached write-through in a local vector store, and is treated as lower-trust than internal ticket history.
-- **Tracing and observability** — each pipeline branch, token count, latency, and failure is traced (Arize/Phoenix), so quality regressions are visible per stage, not just at the final output.
+Runtime guardrails change what the pipeline does; RAGAS-style evaluation measures quality afterward without changing pipeline behavior. Both matter, but they're different mechanisms (detail in [evaluation-and-guardrails.md](evaluation-and-guardrails.md)):
+
+- **Citation validity checks (runtime)** — generated claims are checked against real evidence IDs, with sanitization and conditional repair when a citation doesn't resolve.
+- **Confidence/risk-based routing policy (runtime)** — the classifier enforces which of three routes a case takes; this is a behavior-changing gate, not just a reported metric.
+- **Gated, low-trust external fallback (runtime)** — the StackOverflow web source only engages when internal evidence is thin on an exact match, is cached write-through in a local vector store, and is treated as lower-trust than internal ticket history.
+- **RAGAS-style automated evaluation (offline)** — faithfulness, answer relevance, context precision, and context recall are computed on saved workflow output for quality reporting; they don't feed back into runtime pipeline behavior in the current iteration.
+- **Tracing and observability** — most pipeline stages are traced (validation/redaction, retrieval, evidence assembly, aggregation, reasoning, routing) with tokens, latency, and failures visible per stage (Arize/Phoenix); feedback capture itself is not currently instrumented with its own trace span.
 
 ## Human-in-the-loop design
 
-A classifier/router stage evaluates confidence, severity, and evidence gaps for every case and assigns it to one of two paths: fully autonomous low-risk assist, or human-led review. In the team's demo cases, a deliberately low-confidence ticket returns **context precision and recall of 0.0** rather than a fabricated match — the system correctly recognizes it has no real evidence and escalates instead of guessing. Feedback (a yes/no signal plus human notes) is captured on every case and stored as evaluation data; the first iteration intentionally does not feed it back into automatic retraining, so trust in the feedback signal can be established before it's allowed to change behavior.
+The product concept defines three routing buckets — **fully autonomous** (low risk, high confidence), **semi-autonomous** (known issue, requires human approval before acting), and **human-led** (high risk or low confidence) — and the core workflow's classifier implements and tests all three. The canonical evaluation suite and the lightweight UI demo path currently exercise a simplified two-way split (autonomous vs. human-review); the semi-autonomous middle path exists and is unit-tested but isn't separately represented in the headline evaluation numbers below. In the team's demo cases, a deliberately low-confidence ticket returns **context precision and recall of 0.0** rather than a fabricated match — the system correctly recognizes it has no real evidence and escalates instead of guessing. Feedback (a yes/no signal plus human notes) is captured on every case and stored as evaluation data; the first iteration intentionally does not feed it back into automatic retraining, so trust in the feedback signal can be established before it's allowed to change behavior. Recommendations surface to the engineer working the ticket — nothing in this workflow sends a resolution directly to a customer.
 
 ## Evaluation strategy
 
@@ -116,13 +121,13 @@ Full methodology and caveats are in [evaluation-and-guardrails.md](evaluation-an
 
 ## Prototype results that can be verified
 
-These are prototype evaluation numbers against the public Eclipse dataset — treat them as indicators of pipeline behavior, not production outcomes:
+These are prototype evaluation numbers against the public Eclipse dataset — treat them as indicators of pipeline behavior, not production outcomes. Each links to the exact source file at the commit it was verified against (`520c38a`):
 
-- **Routing accuracy:** 26/26 cases routed to the expected path (autonomous vs. human-review) in the canonical evaluation set.
-- **Faithfulness:** 0.977 average on the autonomous/high-confidence bucket, 0.952 on the human-review/low-confidence bucket.
-- **Context precision/recall:** ~0.99 on the autonomous bucket; deliberately near-zero on the low-confidence demo case, confirming the system doesn't fabricate evidence when there isn't any.
-- **Candidate-depth audit:** on the technical-independent query set, Recall@200 (0.701) was close to oracle Recall@10 (0.693) from the same pool — meaning most retrieval misses were a *promotion/ranking* problem, not a *coverage* problem, which shaped where the team focused optimization effort.
-- **Latency:** a quality-gated optimization pass cut end-to-end synthesis latency roughly 41% (46.7s → 27.4s on the autonomous path) without moving faithfulness or routing accuracy.
+- **Routing accuracy:** 26/26 cases matched their expected route (`verdict_ok: true` for all rows) in the team's consistency regression run — [`reports/workflow/optimization/consistency_results.json`](https://github.com/venkat1596/resolution-intelligence-capstone/blob/520c38a2702db7b20598e49d8ddfc1f65d47c6c8/reports/workflow/optimization/consistency_results.json).
+- **Faithfulness:** 0.977 average on the 13 autonomous/high-confidence cases, 0.952 on the 13 human-review/low-confidence cases — averaged from per-case scores in [`reports/evaluation/canonical_ragas/queries_26_ragas.json`](https://github.com/venkat1596/resolution-intelligence-capstone/blob/520c38a2702db7b20598e49d8ddfc1f65d47c6c8/reports/evaluation/canonical_ragas/queries_26_ragas.json).
+- **Context precision/recall:** ~0.99 on the autonomous bucket (same file); deliberately near-zero on the low-confidence demo case, confirming the system doesn't fabricate evidence when there isn't any.
+- **Candidate-depth audit:** on the technical-independent query set, Recall@200 (0.701) was close to the oracle Recall@10 achievable by reranking within that same 200-candidate pool (0.693) — meaning most retrieval misses were a *promotion/ranking* problem, not a *coverage* problem, which shaped where the team focused optimization effort. Source: [`reports/evaluation/candidate_depth_audit/technical_qwen_issue/summary.json`](https://github.com/venkat1596/resolution-intelligence-capstone/blob/520c38a2702db7b20598e49d8ddfc1f65d47c6c8/reports/evaluation/candidate_depth_audit/technical_qwen_issue/summary.json).
+- **Latency (reported, not independently re-derived):** the team's evaluation write-up reports a quality-gated optimization pass cutting end-to-end synthesis latency roughly 41% (46.7s → 27.4s on the autonomous path; 50.3s → 32.7s on the human-review path) without moving faithfulness or routing accuracy — [`reports/evaluation/canonical_ragas/canonical_ragas_report.tex`](https://github.com/venkat1596/resolution-intelligence-capstone/blob/520c38a2702db7b20598e49d8ddfc1f65d47c6c8/reports/evaluation/canonical_ragas/canonical_ragas_report.tex). This figure lives in the narrative report only — no separate generated benchmark file reproduces the exact numbers at this commit, so treat it as the team's reported result rather than an independently verified one.
 
 ## Product and technical tradeoffs
 
